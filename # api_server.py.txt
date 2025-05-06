@@ -1,0 +1,2845 @@
+# api_server.py
+import asyncio
+import gc
+import sys
+import json
+import logging
+import os
+import random
+import signal
+import ssl
+import subprocess
+import time
+import uuid
+import weakref
+from logging.handlers import RotatingFileHandler
+from typing import Dict, Any, Optional, List, Union
+from urllib.parse import urlparse
+
+import aiojobs
+import aiohttp
+import cachetools
+import mitmproxy.http
+import mitmproxy.options
+import mitmproxy.websocket
+import psutil
+import websockets
+from aiohttp import web
+from mitmproxy.tools import dump
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright_stealth import stealth_async
+import prometheus_client
+
+# Import our new modules
+from db_service import DatabaseService
+from auth import AuthMiddleware
+from rate_limiter import RateLimiter
+from models import Plan, User, MetricsSnapshot
+
+# Configure logging based on environment
+log_level = os.environ.get('LOG_LEVEL', 'INFO')
+log_format = os.environ.get('LOG_FORMAT', '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Set up file handler with rotation
+file_handler = RotatingFileHandler(
+    'logs/api_server.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, log_level), 
+    format=log_format,
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        file_handler  # File output with rotation
+    ]
+)
+
+logger = logging.getLogger('api_server')
+
+def get_config() -> Dict[str, Any]:
+    """Load configuration from environment variables with fallbacks"""
+    return {
+        'mitm_port': int(os.environ.get('MITM_PORT', 8080)),
+        'api_port': int(os.environ.get('API_PORT', 3000)),
+        'max_contexts': int(os.environ.get('MAX_CONTEXTS', 20)),
+        'context_ttl': int(os.environ.get('CONTEXT_TTL', 300)),
+        'cache_size': int(os.environ.get('CACHE_SIZE', 1000)),
+        'cache_ttl': int(os.environ.get('CACHE_TTL', 600)),
+        'max_workers': int(os.environ.get('MAX_WORKERS', 50)),
+        'request_timeout': int(os.environ.get('REQUEST_TIMEOUT', 30)),
+        'ws_idle_timeout': int(os.environ.get('WS_IDLE_TIMEOUT', 600)),
+        'health_check_interval': int(os.environ.get('HEALTH_CHECK_INTERVAL', 60)),
+        'auto_scale': os.environ.get('AUTO_SCALE', 'true').lower() == 'true',
+        'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
+        'kubernetes_enabled': os.environ.get('KUBERNETES_ENABLED', 'false').lower() == 'true',
+        'pod_name': os.environ.get('POD_NAME', 'local'),
+        'namespace': os.environ.get('NAMESPACE', 'default'),
+        'cluster_name': os.environ.get('CLUSTER_NAME', 'local'),
+        'metrics_enabled': os.environ.get('METRICS_ENABLED', 'true').lower() == 'true',
+    }
+
+# Initialize configuration
+CONFIG = get_config()
+
+if CONFIG['debug']:
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger().setLevel(logging.DEBUG)
+
+# Set up metrics if enabled
+if CONFIG['metrics_enabled']:
+    # Create metrics
+    REQUESTS_TOTAL = prometheus_client.Counter(
+        'nodom_requests_total', 
+        'Total count of requests', 
+        ['method', 'endpoint', 'status_code']
+    )
+    REQUEST_LATENCY = prometheus_client.Histogram(
+        'nodom_request_latency_seconds',
+        'Request latency in seconds',
+        ['method', 'endpoint']
+    )
+    ACTIVE_CONNECTIONS = prometheus_client.Gauge(
+        'nodom_active_connections',
+        'Number of active WebSocket connections'
+    )
+    MEMORY_USAGE = prometheus_client.Gauge(
+        'nodom_memory_usage_bytes',
+        'Memory usage in bytes'
+    )
+    CPU_USAGE = prometheus_client.Gauge(
+        'nodom_cpu_usage_percent',
+        'CPU usage percentage'
+    )
+    BROWSER_CONTEXTS = prometheus_client.Gauge(
+        'nodom_browser_contexts',
+        'Number of browser contexts',
+        ['state']
+    )
+    ERRORS_TOTAL = prometheus_client.Counter(
+        'nodom_errors_total',
+        'Total count of errors',
+        ['type']
+    )
+    USER_REQUESTS = prometheus_client.Counter(
+        'nodom_user_requests_total',
+        'Total count of user requests',
+        ['plan', 'route']
+    )
+
+# Global variables
+routes = web.RouteTableDef()
+mitm_proxy = None  # Global reference to MITM proxy
+cert_path = None   # Path to the mitmproxy certificate
+active_websockets = weakref.WeakValueDictionary()  # Store active WebSocket connections
+
+# Database service
+db_service = DatabaseService()
+
+# Performance metrics
+metrics = {
+    'requests_processed': 0,
+    'websocket_connections': 0,
+    'contexts_created': 0,
+    'cache_hits': 0,
+    'cache_misses': 0,
+    'errors': 0,
+    'start_time': time.time()
+}
+
+# Track request URLs to filter in MITM proxy
+target_hosts = set()
+
+# Scheduler for background tasks
+scheduler = None
+
+# Thread-safe ProxyAddon with optimized memory management
+class ProxyAddon:
+    def __init__(self):
+        # Use explicit locks for thread safety
+        self._headers_lock = asyncio.Lock()
+        self._ws_headers_lock = asyncio.Lock()
+        self._cookies_lock = asyncio.Lock()
+        self._request_headers = {}
+        self._ws_headers = {}
+        self._cookies = {}
+        
+        # Periodic cleanup
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 60  # seconds
+    
+    async def set_request_headers(self, request_id, headers):
+        async with self._headers_lock:
+            self._request_headers[request_id] = headers
+            await self._maybe_cleanup()
+    
+    async def set_ws_headers(self, request_id, headers):
+        async with self._ws_headers_lock:
+            self._ws_headers[request_id] = headers
+            await self._maybe_cleanup()
+    
+    async def set_cookies(self, request_id, cookies):
+        async with self._cookies_lock:
+            self._cookies[request_id] = cookies
+            await self._maybe_cleanup()
+    
+    async def _maybe_cleanup(self):
+        """Periodically clean up old request data"""
+        now = time.time()
+        if now - self._last_cleanup > self._cleanup_interval:
+            self._last_cleanup = now
+            asyncio.create_task(self._cleanup_old_requests())
+    
+    async def _cleanup_old_requests(self):
+        """Clean up request data older than 5 minutes"""
+        try:
+            cutoff = time.time() - 300  # 5 minutes
+            
+            async with self._headers_lock:
+                for request_id in list(self._request_headers.keys()):
+                    if request_id.startswith('cleanup_') and float(request_id.split('_')[1]) < cutoff:
+                        del self._request_headers[request_id]
+            
+            async with self._ws_headers_lock:
+                for request_id in list(self._ws_headers.keys()):
+                    if request_id.startswith('cleanup_') and float(request_id.split('_')[1]) < cutoff:
+                        del self._ws_headers[request_id]
+            
+            async with self._cookies_lock:
+                for request_id in list(self._cookies.keys()):
+                    if request_id.startswith('cleanup_') and float(request_id.split('_')[1]) < cutoff:
+                        del self._cookies[request_id]
+        except Exception as e:
+            logger.error(f"[MITM] Error during cleanup: {e}", exc_info=CONFIG['debug'])
+
+    def requestheaders(self, flow: mitmproxy.http.HTTPFlow):
+        try:
+            # Check if this request has our custom header
+            request_id = flow.request.headers.get('X-Request-ID')
+            if not request_id:
+                flow.kill()  # Don't process requests without our custom header
+                return
+            
+            headers = {}
+            ws_headers = {}
+            cookies = {}
+            
+            # Get headers for this specific request - synchronously for MITM
+            if request_id in self._request_headers:
+                headers = self._request_headers[request_id]
+                # Mark for cleanup
+                cleanup_id = f"cleanup_{time.time()}_{request_id}"
+                self._request_headers[cleanup_id] = headers
+                del self._request_headers[request_id]
+            
+            # Get WebSocket headers
+            if request_id in self._ws_headers:
+                ws_headers = self._ws_headers[request_id]
+                # Mark for cleanup
+                cleanup_id = f"cleanup_{time.time()}_{request_id}"
+                self._ws_headers[cleanup_id] = ws_headers
+                del self._ws_headers[request_id]
+            
+            # Get cookies
+            if request_id in self._cookies:
+                cookies = self._cookies[request_id]
+                # Mark for cleanup
+                cleanup_id = f"cleanup_{time.time()}_{request_id}"
+                self._cookies[cleanup_id] = cookies
+                del self._cookies[request_id]
+            
+            # Remove our custom header
+            del flow.request.headers['X-Request-ID']
+            
+            # Check if it's a WebSocket upgrade request
+            if 'Upgrade' in flow.request.headers and flow.request.headers['Upgrade'].lower() == 'websocket':
+                # Apply WebSocket headers
+                for key, value in ws_headers.items():
+                    flow.request.headers[key] = value
+                logger.debug(f"[MITM] Modified WebSocket headers in flow")
+            else:
+                # Apply regular request headers
+                for key, value in headers.items():
+                    flow.request.headers[key] = value
+                logger.debug(f"[MITM] Modified Request headers in flow")
+                    
+            # Apply cookies to all requests
+            if cookies and 'Cookie' in flow.request.headers:
+                # Parse existing cookies
+                existing_cookies = {}
+                for cookie in flow.request.headers['Cookie'].split(';'):
+                    if '=' in cookie:
+                        k, v = cookie.strip().split('=', 1)
+                        existing_cookies[k] = v
+                
+                # Add our cookies
+                existing_cookies.update(cookies)
+                
+                # Reconstruct cookie header
+                cookie_str = '; '.join([f"{k}={v}" for k, v in existing_cookies.items()])
+                flow.request.headers['Cookie'] = cookie_str
+            elif cookies:
+                # No existing cookies, just set ours
+                cookie_str = '; '.join([f"{k}={v}" for k, v in cookies.items()])
+                flow.request.headers['Cookie'] = cookie_str
+                
+        except Exception as e:
+            logger.error(f"[MITM] Error modifying headers: {e}", exc_info=CONFIG['debug'])
+            metrics['errors'] += 1
+
+# Initialize MITM proxy addon
+proxy_addon = ProxyAddon()
+
+# Get or generate mitmproxy certificate
+def get_mitmproxy_cert() -> str:
+    global cert_path
+    
+    # Create a temporary directory for mitmproxy files if needed
+    mitm_dir = os.path.expanduser("~/.mitmproxy")
+    os.makedirs(mitm_dir, exist_ok=True)
+    
+    cert_path = os.path.join(mitm_dir, "mitmproxy-ca-cert.pem")
+    
+    # Check if certificate exists, generate if not
+    if not os.path.exists(cert_path):
+        logger.info("[MITM] Certificate not found, generating...")
+        try:
+            subprocess.run(["mitmdump", "--set", f"confdir={mitm_dir}", "--set", "listen_port=0", "-q"], timeout=2)
+        except subprocess.TimeoutExpired:
+            # This is expected as we're just generating the cert
+            pass
+        
+    if not os.path.exists(cert_path):
+        raise FileNotFoundError(f"Failed to generate mitmproxy certificate at {cert_path}")
+        
+    logger.info(f"[MITM] Using certificate at {cert_path}")
+    return cert_path
+
+def start_mitm_proxy():
+    """Start MITM proxy in a separate thread"""
+    global mitm_proxy
+    
+    # Get the certificate path first
+    cert_file = get_mitmproxy_cert()
+    
+    options = mitmproxy.options.Options(
+        listen_host='127.0.0.1', 
+        listen_port=CONFIG['mitm_port'],
+        ssl_insecure=True,  # Don't verify SSL certs
+    )
+    
+    mitm_proxy = dump.DumpMaster(options, with_termlog=False, with_dumper=False)
+    mitm_proxy.addons.add(proxy_addon)
+    
+    def run_proxy():
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        loop = asyncio.get_event_loop()
+        try:
+            loop.run_until_complete(mitm_proxy.run())
+        except KeyboardInterrupt:
+            pass
+    
+    proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+    proxy_thread.start()
+    logger.info(f"[MITM] Proxy started on 127.0.0.1:{CONFIG['mitm_port']}")
+    
+    return proxy_thread, cert_file
+
+# Optimized browser context pool for Kubernetes
+class BrowserContextPool:
+    def __init__(self, max_size: int, ttl: int):
+        self.contexts = []
+        self.max_size = max_size
+        self.ttl = ttl
+        self.lock = asyncio.Lock()
+        self.last_used = {}
+        self.metrics = {'created': 0, 'reused': 0, 'closed': 0}
+        
+    async def get_context(self, browser: Browser, user_agent: str = None) -> Optional[BrowserContext]:
+        """Get a context from the pool or create a new one"""
+        async with self.lock:
+            now = time.time()
+            
+            # Clean expired contexts
+            i = 0
+            while i < len(self.contexts):
+                context = self.contexts[i]
+                ctx_id = id(context)
+                if now - self.last_used.get(ctx_id, 0) > self.ttl:
+                    await self._close_context(self.contexts.pop(i))
+                    self.metrics['closed'] += 1
+                else:
+                    i += 1
+            
+            # Return existing context if available
+            if self.contexts:
+                context = self.contexts.pop()
+                self.last_used[id(context)] = now
+                self.metrics['reused'] += 1
+                return context
+                
+        # Create a new context if none available
+        try:
+            USER_AGENTS = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.140 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.199 Safari/537.36",
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.70 Mobile Safari/537.36",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/122.0.6261.111 Mobile/15E148 Safari/604.1"
+            ]
+            
+            selected_ua = user_agent or random.choice(USER_AGENTS)
+            context = await browser.new_context(
+                user_agent=selected_ua,
+                viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
+            )
+            await stealth_async(context)
+            
+            async with self.lock:
+                self.last_used[id(context)] = time.time()
+                self.metrics['created'] += 1
+                metrics['contexts_created'] += 1
+                
+            return context
+        except Exception as e:
+            logger.error(f"[Browser] Error creating new context: {e}", exc_info=CONFIG['debug'])
+            metrics['errors'] += 1
+            return None
+    
+    async def return_context(self, context: BrowserContext):
+        """Return a context to the pool or close it"""
+        if not context:
+            return
+        
+        try:
+            # Clear cookies and cache
+            await context.clear_cookies()
+            
+            async with self.lock:
+                # Only return to pool if we haven't reached max size
+                if len(self.contexts) < self.max_size:
+                    self.contexts.append(context)
+                    self.last_used[id(context)] = time.time()
+                else:
+                    await self._close_context(context)
+                    self.metrics['closed'] += 1
+                    
+            # Update metrics for Prometheus
+            if CONFIG['metrics_enabled']:
+                BROWSER_CONTEXTS.labels(state='active').set(len(self.contexts))
+                BROWSER_CONTEXTS.labels(state='created').set(self.metrics['created'])
+                BROWSER_CONTEXTS.labels(state='closed').set(self.metrics['closed'])
+        except Exception as e:
+            logger.error(f"[Browser] Error returning context: {e}", exc_info=CONFIG['debug'])
+            metrics['errors'] += 1
+            try:
+                await self._close_context(context)
+            except:
+                pass
+    
+    async def _close_context(self, context: BrowserContext):
+        """Close a context and clean up"""
+        try:
+            await context.close()
+            ctx_id = id(context)
+            if ctx_id in self.last_used:
+                del self.last_used[ctx_id]
+        except Exception as e:
+            logger.error(f"[Browser] Error closing context: {e}", exc_info=CONFIG['debug'])
+            metrics['errors'] += 1
+
+    async def cleanup(self):
+        """Close all contexts in the pool"""
+        async with self.lock:
+            for context in self.contexts:
+                try:
+                    await context.close()
+                except Exception as e:
+                    logger.error(f"[Browser] Error closing context during cleanup: {e}", exc_info=CONFIG['debug'])
+                    metrics['errors'] += 1
+            self.contexts = []
+            self.last_used = {}
+
+# Optimized browser resource management
+class BrowserManager:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context_pool = None
+        self.lock = asyncio.Lock()
+        
+    async def initialize(self) -> bool:
+        """Initialize browser and context pool"""
+        async with self.lock:
+            if self.browser and self.browser.is_connected():
+                return True
+                
+            try:
+                self.playwright = await async_playwright().start()
+                
+                browser_args = [
+                    '--disable-dev-shm-usage',
+                    '--disable-features=site-per-process', 
+                    '--disable-gpu',
+                    '--disable-setuid-sandbox',
+                    '--no-sandbox',
+                    '--js-flags=--max-old-space-size=512',
+                    '--deterministic-fetch',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-breakpad',
+                    '--disable-component-extensions-with-background-pages',
+                    '--disable-extensions',
+                    '--disable-features=TranslateUI',
+                    '--disable-ipc-flooding-protection',
+                    '--disable-renderer-backgrounding',
+                    '--mute-audio',
+                    '--memory-pressure-off',
+                ]
+                
+                self.browser = await self.playwright.chromium.launch(
+                    headless=True, 
+                    args=browser_args,
+                )
+                
+                self.context_pool = BrowserContextPool(CONFIG['max_contexts'], CONFIG['context_ttl'])
+                
+                # Pre-create some contexts
+                for _ in range(min(5, CONFIG['max_contexts'])):
+                    context = await self.context_pool.get_context(self.browser)
+                    if context:
+                        await self.context_pool.return_context(context)
+                
+                logger.info(f"[Browser] Initialized with {min(5, CONFIG['max_contexts'])} contexts")
+                return True
+            except Exception as e:
+                logger.error(f"[Browser] Failed to initialize: {e}", exc_info=CONFIG['debug'])
+                await self.cleanup()
+                return False
+    
+    async def get_context(self) -> Optional[BrowserContext]:
+        """Get a browser context"""
+        if not self.browser or not self.browser.is_connected():
+            if not await self.initialize():
+                return None
+        
+        return await self.context_pool.get_context(self.browser)
+    
+    async def return_context(self, context: BrowserContext):
+        """Return a context to the pool"""
+        if self.context_pool:
+            await self.context_pool.return_context(context)
+    
+    async def cleanup(self):
+        """Clean up all browser resources"""
+        async with self.lock:
+            if self.context_pool:
+                await self.context_pool.cleanup()
+                self.context_pool = None
+            
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception as e:
+                    logger.error(f"[Browser] Error closing browser: {e}", exc_info=CONFIG['debug'])
+                self.browser = None
+            
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception as e:
+                    logger.error(f"[Browser] Error stopping playwright: {e}", exc_info=CONFIG['debug'])
+                self.playwright = None
+
+# Global browser manager instance
+browser_manager = BrowserManager()
+
+# Header cache with TTL
+header_cache = cachetools.TTLCache(maxsize=CONFIG['cache_size'], ttl=CONFIG['cache_ttl'])
+
+# Optimized extract headers function
+async def extract_headers_with_playwright(url: str, cache_key: str = None) -> Dict[str, Dict]:
+    """Extract headers from a website using Playwright and CDP"""
+    global header_cache, metrics
+    
+    # Use cache if available
+    if cache_key and cache_key in header_cache:
+        metrics['cache_hits'] += 1
+        logger.debug(f"[CDP] Cache hit for {url}")
+        return header_cache[cache_key]
+    
+    metrics['cache_misses'] += 1
+    logger.info(f"[CDP] Extracting headers for: {url}")
+    
+    # Add the target host to our filter list
+    target_host = urlparse(url).netloc
+    target_hosts.add(target_host)
+    
+    # Parse the target URL to determine protocol
+    parsed_url = urlparse(url)
+    
+    # Determine WebSocket URL based on the target URL
+    ws_protocol = "wss" if parsed_url.scheme == "https" else "ws"
+    ws_target = f"{ws_protocol}://ws.ifelse.io"  # Test WebSocket endpoint
+    http_target = url
+    
+    context = None
+    request_headers = {}
+    ws_headers = {}
+    
+    try:
+        # Get a context from the pool
+        context = await browser_manager.get_context()
+        if not context:
+            logger.error("[CDP] Failed to get a browser context")
+            return {"request_headers": {}, "ws_headers": {}}
+            
+        # Create a new page
+        page = await context.new_page()
+        client = await context.new_cdp_session(page)
+
+        # Enable network events
+        await client.send("Network.enable")
+        
+        # Create futures to wait for requests
+        request_headers_future = asyncio.Future()
+        ws_headers_future = asyncio.Future()
+        
+        # Handle request will-be-sent events
+        async def handle_request_will_be_sent(event):
+            headers = event.get("request", {}).get("headers", {})
+            request_url = event.get("request", {}).get("url", "")
+            
+            # Check if it's our injected HTTP request
+            if http_target in request_url and not request_headers_future.done():
+                logger.debug(f"[CDP] Captured HTTP request headers")
+                request_headers_future.set_result(headers)
+        
+        # Handle WebSocket handshake events
+        async def handle_ws_will_be_sent(event):
+            headers = event.get("request", {}).get("headers", {})
+            request_url = headers.get("Host", "")
+            
+            # Check if it's our injected WebSocket handshake
+            if "ifelse.io" in request_url and not ws_headers_future.done():
+                logger.debug(f"[CDP] Captured WebSocket headers")
+                ws_headers_future.set_result(headers)
+        
+        # Set up event listeners
+        client.on("Network.requestWillBeSent", handle_request_will_be_sent)
+        client.on("Network.webSocketWillSendHandshakeRequest", handle_ws_will_be_sent)
+
+        # Navigate to the URL first with a shorter timeout
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=5000)
+        except Exception as e:
+            logger.debug(f"[CDP] Navigation timeout or error (expected): {str(e)}")
+            # Continue anyway as we just need the headers
+        
+        # Inject JavaScript to force both HTTP and WebSocket connections
+        inject_script = f"""
+        (function() {{
+            // Function to create HTTP request
+            function makeHttpRequest() {{
+                console.log('Making HTTP request to {http_target}');
+                fetch('{http_target}', {{
+                    method: 'GET',
+                    credentials: 'include',
+                    cache: 'no-cache',
+                }}).catch(e => console.error('Fetch error:', e));
+            }}
+            
+            // Function to create WebSocket connection
+            function makeWsConnection() {{
+                console.log('Creating WebSocket connection to {ws_target}');
+                const ws = new WebSocket('{ws_target}');
+                ws.onopen = () => console.log('WebSocket connected');
+                ws.onerror = (e) => console.error('WebSocket error:', e);
+                // Close the connection after 1 second
+                setTimeout(() => ws.close(), 1000);
+            }}
+            
+            // Execute both connections
+            makeHttpRequest();
+            makeWsConnection();
+        }})();
+        """
+        
+        # Execute the script
+        await page.evaluate(inject_script)
+        logger.debug("[CDP] Injected connection script into page")
+        
+        # Wait for both headers with shorter timeouts
+        try:
+            request_headers = await asyncio.wait_for(request_headers_future, 10)
+            logger.debug("[CDP] Successfully captured HTTP request headers")
+        except asyncio.TimeoutError:
+            request_headers = {}
+            logger.debug("[CDP] Timeout waiting for HTTP request headers")
+        
+        try:
+            ws_headers = await asyncio.wait_for(ws_headers_future, 10)
+            logger.debug("[CDP] Successfully captured WebSocket headers")
+        except asyncio.TimeoutError:
+            ws_headers = {}
+            logger.debug("[CDP] Timeout waiting for WebSocket headers")
+        
+        # Clean up the page and CDP session
+        await client.detach()
+        await page.close()
+        
+        result = {
+            "request_headers": request_headers,
+            "ws_headers": ws_headers
+        }
+        
+        # Cache the result
+        if cache_key:
+            header_cache[cache_key] = result
+            
+        return result
+        
+    except Exception as e:
+        logger.error(f"[CDP] Error extracting headers: {e}", exc_info=CONFIG['debug'])
+        metrics['errors'] += 1
+        return {
+            "request_headers": {},
+            "ws_headers": {}
+        }
+    finally:
+        if context:
+            # Return the context to the pool
+            await browser_manager.return_context(context)
+
+# Optimized WebSocket bridge with better resource management
+class WebSocketBridge:
+    def __init__(self, client_ws, target_url, headers, cookies, user_id=None, plan_id=None):
+        self.client_ws = client_ws
+        self.target_url = target_url
+        self.headers = headers or {}
+        self.cookies = cookies or {}
+        self.target_ws = None
+        self.connection_id = str(uuid.uuid4())
+        self.running = False
+        self.last_activity = time.time()
+        self.ping_task = None
+        self.forward_client_task = None
+        self.forward_target_task = None
+        self.close_event = asyncio.Event()
+        self.user_id = user_id
+        self.plan_id = plan_id
+        
+        # Track usage metrics
+        self.bytes_sent = 0
+        self.bytes_received = 0
+    
+    async def start(self):
+        """Start the WebSocket bridge"""
+        try:
+            # Parse the target URL for logging
+            target_host = urlparse(self.target_url).netloc
+            target_hosts.add(target_host)
+            
+            # Prepare request ID and headers
+            headers_with_id = {**self.headers, 'X-Request-ID': self.connection_id}
+            
+            # Set WebSocket headers in MITM proxy
+            await proxy_addon.set_ws_headers(self.connection_id, headers_with_id)
+            await proxy_addon.set_cookies(self.connection_id, self.cookies)
+            
+            # Configure SSL
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Prepare headers
+            extra_headers = {**self.headers}
+            
+            # Add cookies if needed
+            if self.cookies:
+                cookie_str = "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
+                extra_headers["Cookie"] = cookie_str
+            
+            # Add request ID
+            extra_headers['X-Request-ID'] = self.connection_id
+            
+            # Get max duration from plan (default to 10 minutes)
+            max_duration = 600  # Default
+            if self.user_id:
+                try:
+                    user_plan = await db_service.get_user_plan(self.user_id)
+                    if user_plan:
+                        max_duration = user_plan.max_duration
+                except Exception as e:
+                    logger.error(f"[WS:{self.connection_id}] Error getting user plan: {e}")
+            
+            # Connect to target WebSocket through MITM proxy
+            self.target_ws = await websockets.connect(
+                self.target_url,
+                additional_headers=extra_headers,
+                proxy=f"http://localhost:{CONFIG['mitm_port']}",
+                ssl=ssl_context,
+                max_size=10 * 1024 * 1024,
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=5,
+            )
+            
+            # Start the bridge
+            self.running = True
+            
+            # Update metrics
+            metrics['websocket_connections'] += 1
+            if CONFIG['metrics_enabled']:
+                ACTIVE_CONNECTIONS.inc()
+                if self.plan_id:
+                    USER_REQUESTS.labels(plan=self.plan_id, route='websocket').inc()
+            
+            # Log connection
+            logger.info(f"[WS:{self.connection_id}] Connected to {target_host}")
+            
+            # Start tasks with proper cancellation handling
+            self.ping_task = asyncio.create_task(self._ping_client())
+            self.forward_client_task = asyncio.create_task(self._forward_to_target())
+            self.forward_target_task = asyncio.create_task(self._forward_to_client())
+            
+            # Create timeout task based on user's plan
+            timeout_task = asyncio.create_task(self._enforce_timeout(max_duration))
+            
+            # Register in active connections
+            active_websockets[self.connection_id] = self
+            
+            # Wait for tasks to complete
+            await asyncio.gather(
+                self.ping_task,
+                self.forward_client_task,
+                self.forward_target_task,
+                timeout_task,
+                return_exceptions=True
+            )
+        except Exception as e:
+            logger.error(f"[WS:{self.connection_id}] Connection error: {e}", exc_info=CONFIG['debug'])
+            metrics['errors'] += 1
+            if CONFIG['metrics_enabled']:
+                ERRORS_TOTAL.labels(type='websocket_connection').inc()
+                
+            try:
+                if not self.client_ws.closed:
+                    await self.client_ws.send_json({"error": str(e)})
+            except:
+                pass
+            await self.close()
+
+    async def _enforce_timeout(self, max_duration):
+        """Enforce maximum WebSocket connection duration"""
+        try:
+            await asyncio.sleep(max_duration)
+            if self.running:
+                logger.info(f"[WS:{self.connection_id}] Max duration reached ({max_duration}s), closing connection")
+                await self.client_ws.send_json({
+                    "type": "timeout",
+                    "message": f"Maximum connection duration of {max_duration} seconds reached"
+                })
+                self.running = False
+                await self.close()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[WS:{self.connection_id}] Error in timeout task: {e}", exc_info=CONFIG['debug'])
+    
+    async def _ping_client(self):
+        """Send periodic pings to client to detect dead connections"""
+        try:
+            while self.running:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                # Check for inactivity timeout
+                if time.time() - self.last_activity > CONFIG['ws_idle_timeout']:
+                    logger.info(f"[WS:{self.connection_id}] Connection timed out due to inactivity")
+                    self.running = False
+                    break
+                
+                # Send ping message if client ws is still open
+                if not self.client_ws.closed:
+                    try:
+                        await self.client_ws.send_json({"type": "ping", "time": time.time()})
+                    except:
+                        # Client connection likely dead
+                        self.running = False
+                        break
+        except Exception as e:
+            logger.error(f"[WS:{self.connection_id}] Error in ping task: {e}", exc_info=CONFIG['debug'])
+        finally:
+            # Ensure connection is closed if ping task exits
+            if self.running:
+                self.running = False
+                await self.close()
+    
+    async def _forward_to_target(self):
+        try:
+            while self.running:
+                try:
+                    message = await asyncio.wait_for(
+                        self.client_ws.receive_json(),
+                        timeout=CONFIG['ws_idle_timeout']
+                    )
+                    self.last_activity = time.time()
+                    
+                    if message.get("type") == "close":
+                        logger.debug(f"[WS:{self.connection_id}] Received close command")
+                        break
+                    elif message.get("type") == "pong":
+                        # Just a pong response, no need to forward
+                        continue
+                    
+                    data = message.get("data")
+                    if data:
+                        await self.target_ws.send(data)
+                        self.bytes_sent += len(data) if isinstance(data, str) else len(str(data))
+                        logger.debug(f"[WS:{self.connection_id}] ► Sent to target")
+                except asyncio.TimeoutError:
+                    logger.debug(f"[WS:{self.connection_id}] Read timeout, checking connection")
+                    # Timeout is handled by ping task
+                    continue
+                except websockets.exceptions.ConnectionClosedOK:
+                    logger.debug(f"[WS:{self.connection_id}] Client closed connection normally")
+                    break
+                except websockets.exceptions.ConnectionClosedError:
+                    logger.debug(f"[WS:{self.connection_id}] Client connection closed with error")
+                    break
+                except Exception as e:
+                    logger.error(f"[WS:{self.connection_id}] Error forwarding to target: {e}", exc_info=CONFIG['debug'])
+                    metrics['errors'] += 1
+                    break
+        finally:
+            if self.running:
+                self.running = False
+                await self.close()
+    
+    async def _forward_to_client(self):
+        try:
+            while self.running:
+                try:
+                    message = await asyncio.wait_for(
+                        self.target_ws.recv(),
+                        timeout=CONFIG['ws_idle_timeout']
+                    )
+                    self.last_activity = time.time()
+                    
+                    if not self.client_ws.closed:
+                        data_size = len(message) if isinstance(message, str) else len(str(message))
+                        self.bytes_received += data_size
+                        
+                        await self.client_ws.send_json({
+                            "type": "message",
+                            "data": message
+                        })
+                        logger.debug(f"[WS:{self.connection_id}] ◄ Received from target")
+                except asyncio.TimeoutError:
+                    logger.debug(f"[WS:{self.connection_id}] Target read timeout, checking connection")
+                    # Timeout is handled by ping task
+                    continue
+                except websockets.exceptions.ConnectionClosedOK:
+                    logger.debug(f"[WS:{self.connection_id}] Target closed connection normally")
+                    break
+                except websockets.exceptions.ConnectionClosedError:
+                    logger.debug(f"[WS:{self.connection_id}] Target connection closed with error")
+                    break
+                except Exception as e:
+                    logger.error(f"[WS:{self.connection_id}] Error forwarding to client: {e}", exc_info=CONFIG['debug'])
+                    metrics['errors'] += 1
+                    break
+        finally:
+            if self.running:
+                self.running = False
+                await self.close()
+    
+    async def close(self):
+        if self.close_event.is_set():
+            return  # Already closing
+            
+        self.close_event.set()
+        logger.info(f"[WS:{self.connection_id}] Closing WebSocket bridge")
+        
+        # Cancel tasks
+        for task in [self.ping_task, self.forward_client_task, self.forward_target_task]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        
+        # Close target WebSocket
+        try:
+            if self.target_ws:
+                await self.target_ws.close()
+        except Exception as e:
+            logger.error(f"[WS:{self.connection_id}] Error closing target WS: {e}", exc_info=CONFIG['debug'])
+        
+        # Close client WebSocket
+        try:
+            if self.client_ws and not self.client_ws.closed:
+                await self.client_ws.close()
+        except Exception as e:
+            logger.error(f"[WS:{self.connection_id}] Error closing client WS: {e}", exc_info=CONFIG['debug'])
+        
+        # Remove from active connections
+        if self.connection_id in active_websockets:
+            del active_websockets[self.connection_id]
+        
+        # Update metrics
+        if CONFIG['metrics_enabled']:
+            ACTIVE_CONNECTIONS.dec()
+            
+        # Track final usage stats if we have a user ID
+        if self.user_id:
+            # Track the full usage
+            total_bytes = self.bytes_sent + self.bytes_received
+            duration = time.time() - self.last_activity
+            
+            # Record usage asynchronously
+            asyncio.create_task(
+                db_service.track_request(
+                    self.user_id, 
+                    self.bytes_sent,
+                    self.bytes_received,
+                    duration,
+                    is_websocket=True,
+                    error=False
+                )
+            )
+            
+        # Clean up request-specific data
+        await proxy_addon.set_request_headers(self.connection_id, {})
+        await proxy_addon.set_ws_headers(self.connection_id, {})
+        await proxy_addon.set_cookies(self.connection_id, {})
+
+# API Routes
+@routes.post("/proxy")
+async def handle_proxy_request(request):
+    metrics['requests_processed'] += 1
+    request_id = str(uuid.uuid4())
+    
+    # Get user info from request (added by auth middleware)
+    user_id = request.get('user_id')
+    user = request.get('user')
+    plan_id = user.get('plan_id', 'free') if user else 'anonymous'
+    
+    if CONFIG['metrics_enabled']:
+        USER_REQUESTS.labels(plan=plan_id, route='proxy').inc()
+    
+    start_time = time.time()
+    
+    try:
+        # Check request body size
+        if request.content_length and request.content_length > 1024 * 1024:  # 1MB limit
+            return web.json_response({"error": "Request body too large"}, status=413)
+            
+        # Parse request with timeout
+        try:
+            data = await asyncio.wait_for(request.json(), timeout=2.0)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": "Request body parsing timeout"}, status=408)
+            
+        target_url = data.get("url")
+        method = data.get("method", "GET").upper()
+        headers = data.get("headers", {})
+        cookies = data.get("cookies", {})
+        request_data = data.get("data")
+        
+        if not target_url:
+            return web.json_response({"error": "Missing target URL"}, status=400)
+        
+        logger.info(f"[API] Proxy request {request_id}: {method} {target_url}")
+        
+        # Add the target host to our filter list
+        target_host = urlparse(target_url).netloc
+        target_hosts.add(target_host)
+        
+        # Generate cache key for the headers
+        cache_key = f"{target_host}_{hash(frozenset(headers.items()) if headers else 0)}"
+
+        # Generate cache key for the headers
+        http_url = target_url.replace('ws://', 'http://').replace('wss://', 'https://')
+
+         # Parse the URL
+        parsed = urlparse(http_url)
+        
+        # Get only the scheme and netloc (e.g. https://example.com)
+        base_http_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # First, get the headers from the target using Playwright
+        site_headers = await extract_headers_with_playwright(base_http_url, cache_key)
+        
+        # Merge the extracted headers with the user-provided headers
+        merged_headers = {**site_headers["request_headers"], **headers}
+        
+        # Add our custom request ID header
+        merged_headers['X-Request-ID'] = request_id
+        
+        # Set headers in the modifier for MITM proxy
+        await proxy_addon.set_request_headers(request_id, merged_headers)
+        await proxy_addon.set_cookies(request_id, cookies)
+        
+        # Get user's plan (to determine timeouts and limits)
+        max_response_size = 20 * 1024 * 1024  # Default: 20MB
+        request_timeout = CONFIG['request_timeout']  # Default from config
+        
+        if user_id:
+            try:
+                user_plan = await db_service.get_user_plan(user_id)
+                if user_plan:
+                    max_response_size = user_plan.max_response_size
+                    request_timeout = min(user_plan.max_duration, 300)  # Cap at 5 minutes
+            except Exception as e:
+                logger.error(f"[API] Error getting user plan: {e}")
+        
+        # Create a client session with proxy
+        timeout = aiohttp.ClientTimeout(total=request_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Prepare the request
+            request_kwargs = {
+                "method": method,
+                "url": target_url,
+                "headers": merged_headers,
+                "proxy": f"http://localhost:{CONFIG['mitm_port']}",
+                "ssl": False,  # Don't verify SSL when using the proxy
+            }
+            
+            # Add data if applicable
+            if request_data and method in ["POST", "PUT", "PATCH"]:
+                if isinstance(request_data, dict):
+                    request_kwargs["json"] = request_data
+                else:
+                    request_kwargs["data"] = request_data
+            
+            # Make the request with timeout
+            try:
+                async with session.request(**request_kwargs) as response:
+                    # Get response headers
+                    response_headers = dict(response.headers)
+                    
+                    # Get response body with streaming for large responses
+                    if response.content_length and response.content_length > max_response_size:
+                        return web.json_response({
+                            "error": "Response too large",
+                            "message": f"The response size exceeds your plan's limit of {max_response_size // (1024 * 1024)}MB"
+                        }, status=413)
+                    
+                    # Stream response (with size check)
+                    chunks = []
+                    total_size = 0
+                    
+                    async for chunk in response.content.iter_any():
+                        total_size += len(chunk)
+                        if total_size > max_response_size:
+                            return web.json_response({
+                                "error": "Response too large",
+                                "message": f"The response size exceeds your plan's limit of {max_response_size // (1024 * 1024)}MB"
+                            }, status=413)
+                            
+                        chunks.append(chunk)
+                    
+                    body = b''.join(chunks)
+                    
+                    # Try to decode as JSON or text
+                    if response.content_type == 'application/json':
+                        try:
+                            response_data = json.loads(body.decode('utf-8'))
+                        except:
+                            response_data = body.decode('utf-8', errors='replace')
+                    else:
+                        response_data = body.decode('utf-8', errors='replace')
+                    
+                    # Track usage if we have a user ID
+                    if user_id:
+                        duration = time.time() - start_time
+                        bytes_sent = request.content_length or 0
+                        bytes_received = len(body)
+                        
+                        # Track usage in background
+                        asyncio.create_task(
+                            db_service.track_request(
+                                user_id,
+                                bytes_sent,
+                                bytes_received,
+                                duration,
+                                is_websocket=False,
+                                error=False
+                            )
+                        )
+                    
+                    # Update metrics
+                    if CONFIG['metrics_enabled']:
+                        REQUESTS_TOTAL.labels(
+                            method=method, 
+                            endpoint='proxy', 
+                            status_code=response.status
+                        ).inc()
+                        REQUEST_LATENCY.labels(
+                            method=method, 
+                            endpoint='proxy'
+                        ).observe(time.time() - start_time)
+                    
+                    logger.debug(f"[API] Completed request {request_id} in {time.time() - start_time:.2f}s")
+                    return web.json_response({
+                        "status": response.status,
+                        "headers": response_headers,
+                        "data": response_data
+                    })
+            except asyncio.TimeoutError:
+                logger.warning(f"[API] Request {request_id} timed out after {time.time() - start_time:.2f}s")
+                
+                # Track error if we have a user ID
+                if user_id:
+                    duration = time.time() - start_time
+                    bytes_sent = request.content_length or 0
+                    
+                    # Track error in background
+                    asyncio.create_task(
+                        db_service.track_request(
+                            user_id,
+                            bytes_sent,
+                            0,
+                            duration,
+                            is_websocket=False,
+                            error=True
+                        )
+                    )
+                
+                if CONFIG['metrics_enabled']:
+                    ERRORS_TOTAL.labels(type='request_timeout').inc()
+                    
+                return web.json_response({
+                    "error": f"Request timed out after {request_timeout} seconds"
+                }, status=504)
+            except aiohttp.ClientError as e:
+                logger.error(f"[API] Client error for {request_id}: {e}", exc_info=CONFIG['debug'])
+                metrics['errors'] += 1
+                
+                # Track error if we have a user ID
+                if user_id:
+                    duration = time.time() - start_time
+                    bytes_sent = request.content_length or 0
+                    
+                    # Track error in background
+                    asyncio.create_task(
+                        db_service.track_request(
+                            user_id,
+                            bytes_sent,
+                            0,
+                            duration,
+                            is_websocket=False,
+                            error=True
+                        )
+                    )
+                
+                if CONFIG['metrics_enabled']:
+                    ERRORS_TOTAL.labels(type='client_error').inc()
+                    
+                return web.json_response({
+                    "error": f"Connection error: {str(e)}"
+                }, status=502)
+                
+    except Exception as e:
+        logger.exception(f"[API] Error handling proxy request {request_id}: ")
+        metrics['errors'] += 1
+        
+        if CONFIG['metrics_enabled']:
+            ERRORS_TOTAL.labels(type='server_error').inc()
+            
+        # Track error if we have a user ID
+        if user_id:
+            duration = time.time() - start_time
+            bytes_sent = request.content_length or 0
+            
+            # Track error in background
+            asyncio.create_task(
+                db_service.track_request(
+                    user_id,
+                    bytes_sent,
+                    0,
+                    duration,
+                    is_websocket=False,
+                    error=True
+                )
+            )
+            
+        return web.json_response({"error": str(e)}, status=500)
+    finally:
+        # Clean up request-specific data
+        await proxy_addon.set_request_headers(request_id, {})
+        await proxy_addon.set_ws_headers(request_id, {})
+        await proxy_addon.set_cookies(request_id, {})
+
+@routes.get("/ws")
+async def websocket_handler(request):
+    ws = web.WebSocketResponse(
+        heartbeat=30,
+        autoping=True,
+        max_msg_size=10 * 1024 * 1024,  # 10MB max message size
+    )
+    await ws.prepare(request)
+    
+    connection_id = str(uuid.uuid4())
+    
+    # Get user info from request (added by auth middleware)
+    user_id = request.get('user_id')
+    user = request.get('user')
+    plan_id = user.get('plan_id', 'free') if user else 'anonymous'
+    
+    logger.info(f"[WS:{connection_id}] Client connected (User: {user_id}, Plan: {plan_id})")
+    
+    try:
+        # Check if user has exceeded WebSocket connection limits
+        if user_id:
+            limit_exceeded = await db_service.check_rate_limits(user_id, is_websocket=True)
+            if limit_exceeded:
+                await ws.send_json({
+                    "error": "WebSocket connection limit exceeded",
+                    "message": "You have reached your daily WebSocket connection limit. Please upgrade your plan."
+                })
+                return ws
+        
+        # Add timing out for initial connection message
+        try:
+            connect_msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+        except asyncio.TimeoutError:
+            await ws.send_json({"error": "Connection timed out waiting for initial message"})
+            return ws
+        
+        # Check if this is a connect request
+        if connect_msg.get("type") != "connect":
+            await ws.send_json({"error": "First message must be a connect message"})
+            return ws
+        
+        # Get connection details
+        target_url = connect_msg.get("url")
+        headers = connect_msg.get("headers", {})
+        cookies = connect_msg.get("cookies", {})
+        
+        if not target_url:
+            await ws.send_json({"error": "Missing target WebSocket URL"})
+            return ws
+        
+        # Validate WebSocket URL
+        if not target_url.startswith(('ws://', 'wss://')):
+            await ws.send_json({"error": "Invalid WebSocket URL. Must start with ws:// or wss://"})
+            return ws
+            
+        # Add the target host to our filter list
+        target_host = urlparse(target_url).netloc
+        target_hosts.add(target_host)
+        
+        # Generate cache key for the headers
+        http_url = target_url.replace('ws://', 'http://').replace('wss://', 'https://')
+         # Parse the URL
+        parsed = urlparse(http_url)
+        
+        # Get only the scheme and netloc
+        base_http_url = f"{parsed.scheme}://{parsed.netloc}"
+        cache_key = f"{target_host}_{hash(frozenset(headers.items()) if headers else 0)}"
+        
+        # Get headers from the target site using Playwright
+        site_info = await extract_headers_with_playwright(base_http_url, cache_key)
+        
+        # Merge the extracted WebSocket headers with the user-provided headers
+        merged_headers = {**site_info["ws_headers"], **headers}
+        
+        # Create WebSocket bridge
+        bridge = WebSocketBridge(ws, target_url, merged_headers, cookies, user_id, plan_id)
+        active_websockets[connection_id] = bridge
+        
+        # Start the bridge
+        await bridge.start()
+        
+    except Exception as e:
+        logger.exception(f"[WS:{connection_id}] Error in WebSocket handler: ")
+        metrics['errors'] += 1
+        
+        if CONFIG['metrics_enabled']:
+            ERRORS_TOTAL.labels(type='websocket_handler').inc()
+            
+        if not ws.closed:
+            await ws.send_json({"error": str(e)})
+    
+    logger.info(f"[WS:{connection_id}] WebSocket connection closed")
+    return ws
+
+@routes.get("/status")
+async def status_handler(request):
+    # Calculate uptime
+    uptime = time.time() - metrics['start_time']
+    
+    # Get process stats
+    process = psutil.Process(os.getpid())
+    memory_usage = process.memory_info().rss / (1024 * 1024)  # MB
+    cpu_percent = process.cpu_percent(interval=0.5)
+    
+    # System stats
+    system_memory = psutil.virtual_memory()
+    system_memory_percent = system_memory.percent
+    
+    # Calculate requests per second
+    requests_per_second = metrics['requests_processed'] / max(uptime, 1)
+    
+    # Get browser context pool metrics
+    browser_metrics = {}
+    if browser_manager and browser_manager.context_pool:
+        browser_metrics = browser_manager.context_pool.metrics
+    
+    # Update Prometheus metrics if enabled
+    if CONFIG['metrics_enabled']:
+        MEMORY_USAGE.set(process.memory_info().rss)
+        CPU_USAGE.set(cpu_percent)
+    
+    status_data = {
+        "status": "running",
+        "uptime": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s",
+        "active_websockets": len(active_websockets),
+        "proxy_running": mitm_proxy is not None,
+        "browser_status": "running" if browser_manager.browser else "not started",
+        "browser_contexts": browser_metrics,
+        "target_hosts": list(target_hosts),
+        "metrics": {
+            "requests_processed": metrics['requests_processed'],
+            "requests_per_second": round(requests_per_second, 2),
+            "websocket_connections": metrics['websocket_connections'],
+            "contexts_created": metrics['contexts_created'],
+            "cache_hits": metrics['cache_hits'],
+            "cache_misses": metrics['cache_misses'],
+            "cache_hit_ratio": round(metrics['cache_hits'] / max(metrics['cache_hits'] + metrics['cache_misses'], 1), 2),
+            "errors": metrics['errors'],
+        },
+        "system": {
+            "memory_usage_mb": round(memory_usage, 2),
+            "cpu_percent": round(cpu_percent, 2),
+            "system_memory_percent": round(system_memory_percent, 2),
+            "pod_name": CONFIG['pod_name'],
+            "namespace": CONFIG['namespace'],
+            "cluster": CONFIG['cluster_name']
+        },
+        "config": CONFIG
+    }
+    
+    # Record metrics snapshot in database
+    if db_service:
+        snapshot_data = {
+            "total_requests": metrics['requests_processed'],
+            "active_websockets": len(active_websockets),
+            "memory_usage": memory_usage,
+            "cpu_usage": cpu_percent,
+            "error_rate": metrics['errors'] / max(metrics['requests_processed'], 1),
+            "active_users": len(active_websockets)
+        }
+        asyncio.create_task(db_service.record_metrics_snapshot(snapshot_data))
+    
+    return web.json_response(status_data)
+
+@routes.get("/metrics")
+async def metrics_handler(request):
+    """Prometheus metrics endpoint"""
+    if not CONFIG['metrics_enabled']:
+        return web.Response(text="Metrics are disabled", status=404)
+        
+    resp = web.Response(body=prometheus_client.generate_latest())
+    resp.content_type = "text/plain"
+    return resp
+
+@routes.get("/health")
+async def health_handler(request):
+    """Kubernetes health check endpoint"""
+    # Simple health check - if we're processing requests, we're healthy
+    if browser_manager.browser and browser_manager.browser.is_connected():
+        return web.json_response({"status": "ok"})
+    else:
+        # Try to initialize the browser
+        initialized = await browser_manager.initialize()
+        if initialized:
+            return web.json_response({"status": "ok"})
+        else:
+            return web.json_response({"status": "error", "message": "Browser disconnected"}, status=500)
+
+@routes.get("/readiness")
+async def readiness_handler(request):
+    """Kubernetes readiness check endpoint"""
+    # Check if we're ready to serve requests
+    if (mitm_proxy is not None and 
+        browser_manager.browser and 
+        browser_manager.browser.is_connected() and 
+        db_service):
+        return web.json_response({"status": "ready"})
+    else:
+        components = {
+            "mitm_proxy": mitm_proxy is not None,
+            "browser": browser_manager.browser is not None,
+            "browser_connected": browser_manager.browser and browser_manager.browser.is_connected(),
+            "db_service": db_service is not None
+        }
+        return web.json_response({"status": "not ready", "components": components}, status=503)
+
+@routes.get("/plans")
+async def plans_handler(request):
+    """Get available subscription plans"""
+    all_plans = [
+        {
+            "id": plan.id,
+            "name": plan.name,
+            "description": plan.description,
+            "price": plan.price,
+            "features": plan.features,
+            "limits": {
+                "requests_limit": plan.requests_limit,
+                "websocket_limit": plan.websocket_limit,
+                "concurrent_connections": plan.concurrent_connections,
+                "max_request_size": plan.max_request_size // (1024 * 1024),  # Convert to MB
+                "max_response_size": plan.max_response_size // (1024 * 1024),  # Convert to MB
+                "max_duration": plan.max_duration
+            }
+        } 
+        for plan in Plan.all_plans()
+    ]
+    
+    return web.json_response({
+        "plans": all_plans,
+        "website": "https://nodom.io",
+        "documentation_url": "https://docs.nodom.io"
+    })
+
+# User Registration and Authentication Endpoints
+@routes.post("/register")
+async def register_handler(request):
+    """Register a new user account"""
+    try:
+        data = await request.json()
+        username = data.get("username")
+        email = data.get("email")
+        password = data.get("password")
+        
+        if not username or not email or not password:
+            return web.json_response({
+                "error": "Missing required fields",
+                "message": "Username, email, and password are required"
+            }, status=400)
+        
+        # Hash password before storing
+        import bcrypt
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        # Create user
+        user = await db_service.create_user(username, email, password_hash)
+        
+        if not user:
+            return web.json_response({
+                "error": "Registration failed",
+                "message": "Username or email already exists"
+            }, status=409)
+            
+        return web.json_response({
+            "message": "Registration successful",
+            "username": user.username,
+            "api_key": user.api_key
+        })
+    except Exception as e:
+        logger.exception(f"[Auth] Registration error: ")
+        return web.json_response({"error": str(e)}, status=500)
+
+@routes.post("/login")
+async def login_handler(request):
+    """User login endpoint"""
+    try:
+        data = await request.json()
+        username_or_email = data.get("username")  # Can be username or email
+        password = data.get("password")
+        
+        if not username_or_email or not password:
+            return web.json_response({
+                "error": "Missing credentials",
+                "message": "Username and password are required"
+            }, status=400)
+        
+        # Find user
+        user = await db_service.users.find_one({
+            "$or": [
+                {"username": username_or_email},
+                {"email": username_or_email}
+            ]
+        })
+        
+        if not user:
+            return web.json_response({
+                "error": "Authentication failed",
+                "message": "Invalid username or password"
+            }, status=401)
+            
+        # Verify password
+        import bcrypt
+        if not bcrypt.checkpw(password.encode('utf-8'), user["password_hash"].encode('utf-8')):
+            return web.json_response({
+                "error": "Authentication failed",
+                "message": "Invalid username or password"
+            }, status=401)
+            
+        # Successful login
+        return web.json_response({
+            "message": "Login successful",
+            "username": user["username"],
+            "api_key": user["api_key"]
+        })
+    except Exception as e:
+        logger.exception(f"[Auth] Login error: ")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Main application setup and run function
+async def main():
+    try:
+        # Register signal handlers
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal_handler)
+        
+        # Initialize database service
+        logger.info("[Init] Initializing database service...")
+        try:
+            await db_service.initialize()
+        except Exception as e:
+            logger.error(f"[Init] Database initialization error: {e}", exc_info=CONFIG['debug'])
+            logger.warning("[Init] Continuing without full database functionality")
+        
+        # Initialize scheduler for background tasks
+        global scheduler
+        try:
+            scheduler = await aiojobs.create_scheduler(
+                limit=CONFIG['max_workers'],
+                pending_limit=2 * CONFIG['max_workers'],
+                close_timeout=10.0
+            )
+        except Exception as e:
+            logger.error(f"[Init] Scheduler initialization error: {e}", exc_info=CONFIG['debug'])
+            return 1
+
+        # Setup auth and rate limiting middleware
+        auth_middleware = AuthMiddleware(db_service)
+        rate_limiter = RateLimiter(db_service)
+        
+        # Create the API application with proper limits and middleware
+        app = web.Application(
+            client_max_size=10 * 1024 * 1024,  # 10MB max request size
+            middlewares=[
+                auth_middleware.auth_middleware,
+                rate_limiter.rate_limit_middleware
+            ]
+        )
+        
+        # Try-except for background tasks scheduler
+        try:
+            app['background_tasks'] = await aiojobs.create_scheduler()
+        except Exception as e:
+            logger.error(f"[Init] Background task scheduler error: {e}", exc_info=CONFIG['debug'])
+            app['background_tasks'] = None  # Set to None so we can check later
+        
+        app.add_routes(routes)
+        app.on_cleanup.append(lambda app: asyncio.create_task(cleanup_resources()))
+
+        # Track initialized components for cleanup
+        components_initialized = []
+        
+        try:
+            # Start MITM proxy
+            logger.info("[Init] Starting MITM proxy...")
+            try:
+                proxy_thread, certificate_path = start_mitm_proxy()
+                components_initialized.append("mitm_proxy")
+            except Exception as e:
+                logger.error(f"[Init] Failed to start MITM proxy: {e}", exc_info=CONFIG['debug'])
+                return 1
+            
+            # Initialize browser
+            logger.info("[Init] Initializing browser...")
+            try:
+                if not await browser_manager.initialize():
+                    logger.critical("[Init] Failed to initialize browser, exiting")
+                    await cleanup_resources()
+                    return 1
+                components_initialized.append("browser")
+            except Exception as e:
+                logger.error(f"[Init] Browser initialization error: {e}", exc_info=CONFIG['debug'])
+                return 1
+            
+            # Schedule background tasks only if scheduler initialized successfully
+            if scheduler:
+                logger.info("[Init] Scheduling background tasks...")
+                try:
+                    await scheduler.spawn(periodic_task(check_browser_health, CONFIG['health_check_interval']))
+                    await scheduler.spawn(monitor_system_resources())
+                    components_initialized.append("scheduler")
+                except Exception as e:
+                    logger.error(f"[Init] Error scheduling tasks: {e}", exc_info=CONFIG['debug'])
+            
+            # Start API server
+            logger.info("[Init] Starting API server...")
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", CONFIG['api_port'])
+            await site.start()
+            components_initialized.append("api_server")
+            
+            logger.info(f"[Server] API running at http://0.0.0.0:{CONFIG['api_port']}")
+            logger.info(f"[Server] WebSocket endpoint at ws://0.0.0.0:{CONFIG['api_port']}/ws")
+            logger.info(f"[Server] Status endpoint at http://0.0.0.0:{CONFIG['api_port']}/status")
+            
+            # Keep the application running until interrupted
+            while True:
+                await asyncio.sleep(1)
+                
+        except asyncio.CancelledError:
+            logger.info("[Server] Application cancelled, shutting down...")
+        except Exception as e:
+            logger.exception("[Server] Unexpected error in main loop:")
+            return 1
+        finally:
+            # Graceful shutdown in reverse order of initialization
+            for component in reversed(components_initialized):
+                logger.info(f"[Shutdown] Cleaning up {component}...")
+            
+            await cleanup_resources()
+            
+            if 'runner' in locals():
+                logger.info("[Shutdown] Cleaning up web runner...")
+                await runner.cleanup()
+            
+            logger.info("[Shutdown] Application shutdown complete")
+    except Exception as e:
+        logger.exception(f"[Main] Fatal error: {e}")
+        return 1
+    
+    return 0
+
+
+# auth.py
+import logging
+from typing import Optional, Tuple
+import time
+
+from aiohttp import web
+from db_service import DatabaseService
+
+logger = logging.getLogger('auth')
+
+class AuthMiddleware:
+    def __init__(self, db_service: DatabaseService):
+        self.db_service = db_service
+        
+    @web.middleware
+    async def auth_middleware(self, request, handler):
+        # Skip authentication for public endpoints
+        if request.path in ['/login', '/register', '/health', '/metrics', '/plans'] or request.path.startswith('/static/'):
+            return await handler(request)
+            
+        # Extract API key from headers or query parameters
+        api_key = request.headers.get('X-API-Key') or request.query.get('api_key')
+        
+        if not api_key:
+            return web.json_response({
+                "error": "Authentication required",
+                "message": "Please provide your API key in the X-API-Key header or api_key query parameter"
+            }, status=401)
+            
+        # Get user from API key
+        user = await self.db_service.get_user_by_api_key(api_key)
+        
+        if not user:
+            return web.json_response({
+                "error": "Invalid API key",
+                "message": "The provided API key is invalid or has been revoked"
+            }, status=401)
+            
+        if not user.get('is_active', False):
+            return web.json_response({
+                "error": "Account inactive",
+                "message": "Your account has been deactivated"
+            }, status=403)
+            
+        # Add user to request for further processing
+        request['user'] = user
+        request['user_id'] = user['id']
+        
+        # Process the request
+        start_time = time.time()
+        try:
+            response = await handler(request)
+            
+            # Track usage on successful response
+            duration = time.time() - start_time
+            
+            # Track request in background without awaiting
+            # This prevents tracking from affecting response time
+            is_websocket = request.path == '/ws'
+            bytes_sent = len(response.body) if hasattr(response, 'body') and response.body else 0
+            bytes_received = request.content_length or 0
+            
+            # fire and forget
+            request.app['background_tasks'].create_task(
+                self.db_service.track_request(
+                    user['id'], 
+                    bytes_sent, 
+                    bytes_received, 
+                    duration, 
+                    is_websocket,
+                    error=False
+                )
+            )
+            
+            return response
+        except Exception as e:
+            # Track error
+            duration = time.time() - start_time
+            is_websocket = request.path == '/ws'
+            
+            # fire and forget
+            request.app['background_tasks'].create_task(
+                self.db_service.track_request(
+                    user['id'], 
+                    0, 
+                    request.content_length or 0, 
+                    duration, 
+                    is_websocket,
+                    error=True
+                )
+            )
+            raise
+
+
+# db_service.py
+import os
+import logging
+import asyncio
+from datetime import datetime, timedelta, date
+import motor.motor_asyncio
+from pymongo import MongoClient, ASCENDING, UpdateOne
+from pymongo.errors import DuplicateKeyError
+import redis.asyncio as redis
+from typing import Dict, List, Optional, Any, Tuple
+import json
+
+from models import User, Plan, Usage
+
+logger = logging.getLogger('db_service')
+
+class DatabaseService:
+    def __init__(self):
+        # MongoDB connection
+        mongo_uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
+        self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(mongo_uri)
+        self.db = self.mongo_client.nodom_db
+        
+        # Initialize collections
+        self.users = self.db.users
+        self.usage = self.db.usage
+        self.plans = self.db.plans
+        self.metrics = self.db.metrics
+        
+        # Redis connection for caching and rate limiting
+        redis_uri = os.environ.get('REDIS_URI', 'redis://localhost:6379/0')
+        self.redis = redis.from_url(redis_uri, decode_responses=True)
+
+    async def initialize(self):
+        """Initialize database with indexes and default data"""
+        try:
+            # Create indexes for MongoDB
+            await self.users.create_index([("username", ASCENDING)], unique=True)
+            await self.users.create_index([("email", ASCENDING)], unique=True)
+            await self.users.create_index([("api_key", ASCENDING)], unique=True)
+            
+            await self.usage.create_index([("user_id", ASCENDING), ("date", ASCENDING)], unique=True)
+            
+            # Check if plans exist and create defaults if not
+            plans_count = await self.plans.count_documents({})
+            if plans_count == 0:
+                # Initialize default plans
+                for plan in Plan.all_plans():
+                    await self.plans.insert_one(plan.dict())
+                logger.info("Default plans have been created")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Database initialization error: {str(e)}")
+            return False
+
+    # User management functions
+    async def create_user(self, username: str, email: str, password_hash: str) -> Optional[User]:
+        """Create a new user with free plan"""
+        try:
+            user = User(
+                username=username,
+                email=email,
+                password_hash=password_hash,
+                plan_id="free"
+            )
+            
+            await self.users.insert_one(user.dict())
+            return user
+        except DuplicateKeyError:
+            logger.warning(f"Duplicate user attempted: {username}, {email}")
+            return None
+        except Exception as e:
+            logger.error(f"Error creating user: {str(e)}")
+            return None
+
+    async def get_user_by_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
+        """Get user by API key"""
+        # Check in Redis cache first
+        redis_key = f"user:api:{api_key}"
+        user_data = await self.redis.get(redis_key)
+        
+        if user_data:
+            return json.loads(user_data)
+            
+        # If not in cache, check in MongoDB
+        user = await self.users.find_one({"api_key": api_key})
+        if user:
+            # Remove _id for JSON serialization
+            if "_id" in user:
+                user["_id"] = str(user["_id"])
+                
+            # Cache for 5 minutes
+            await self.redis.set(redis_key, json.dumps(user), ex=300)
+        
+        return user
+
+    async def update_user_plan(self, user_id: str, plan_id: str) -> bool:
+        """Update user's subscription plan"""
+        try:
+            # Verify plan exists
+            plan = await self.plans.find_one({"id": plan_id})
+            if not plan:
+                logger.error(f"Plan {plan_id} does not exist")
+                return False
+                
+            # Update user's plan
+            result = await self.users.update_one(
+                {"id": user_id},
+                {"$set": {"plan_id": plan_id}}
+            )
+            
+            if result.modified_count == 0:
+                logger.warning(f"User {user_id} not found or plan not changed")
+                return False
+                
+            # Invalidate cache
+            user = await self.users.find_one({"id": user_id})
+            if user and "api_key" in user:
+                await self.redis.delete(f"user:api:{user['api_key']}")
+                await self.redis.delete(f"plan:{user_id}")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error updating user plan: {str(e)}")
+            return False
+
+    async def get_user_plan(self, user_id: str) -> Optional[Plan]:
+        """Get the current plan for a user"""
+        # Check cache first
+        redis_key = f"plan:{user_id}"
+        plan_data = await self.redis.get(redis_key)
+        
+        if plan_data:
+            return Plan(**json.loads(plan_data))
+            
+        # Get from database if not in cache
+        try:
+            user = await self.users.find_one({"id": user_id})
+            if not user:
+                return None
+                
+            plan_id = user.get("plan_id", "free")
+            plan_doc = await self.plans.find_one({"id": plan_id})
+            
+            if plan_doc:
+                plan = Plan(**plan_doc)
+                # Cache for 10 minutes
+                await self.redis.set(redis_key, json.dumps(plan_doc), ex=600)
+                return plan
+                
+            return None
+        except Exception as e:
+            logger.error(f"Error getting user plan: {str(e)}")
+            return None
+
+    # Usage tracking functions
+    async def track_request(self, user_id: str, bytes_sent: int, bytes_received: int, 
+                         duration: float, is_websocket: bool, error: bool = False) -> Tuple[bool, bool]:
+        """
+        Track user request and check limits
+        Returns: (success, limit_exceeded)
+        """
+        today = date.today().isoformat()
+        
+        try:
+            # Increment usage counters atomically
+            update = {
+                "$inc": {
+                    "requests_count": 0 if is_websocket else 1,
+                    "websocket_connections": 1 if is_websocket else 0,
+                    "data_transferred": bytes_sent + bytes_received,
+                    "request_duration": duration,
+                    "errors": 1 if error else 0
+                },
+                "$set": {"last_updated": datetime.utcnow()}
+            }
+            
+            # Upsert usage document for today
+            await self.usage.update_one(
+                {"user_id": user_id, "date": today},
+                update,
+                upsert=True
+            )
+            
+            # Check if user has exceeded limits
+            limit_exceeded = await self.check_rate_limits(user_id, is_websocket)
+            
+            return True, limit_exceeded
+        except Exception as e:
+            logger.error(f"Error tracking usage for user {user_id}: {str(e)}")
+            return False, False
+
+    async def check_rate_limits(self, user_id: str, is_websocket: bool) -> bool:
+        """
+        Check if user has exceeded rate limits
+        Returns True if limits are exceeded
+        """
+        try:
+            # Get user's plan
+            plan = await self.get_user_plan(user_id)
+            if not plan:
+                return True  # No plan = no access
+                
+            today = date.today().isoformat()
+            
+            # Get today's usage
+            usage_doc = await self.usage.find_one({"user_id": user_id, "date": today})
+            if not usage_doc:
+                return False  # No usage yet, definitely not exceeded
+                
+            # Check appropriate limits based on type
+            if is_websocket:
+                if usage_doc.get("websocket_connections", 0) > plan.websocket_limit:
+                    logger.info(f"User {user_id} exceeded WebSocket limit of {plan.websocket_limit}")
+                    return True
+            else:
+                if usage_doc.get("requests_count", 0) > plan.requests_limit:
+                    logger.info(f"User {user_id} exceeded request limit of {plan.requests_limit}")
+                    return True
+                    
+            # Could add more complex rate limiting logic here
+            # Like concurrent connection limits, bandwidth limits, etc.
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error checking rate limits for user {user_id}: {str(e)}")
+            return True  # Fail closed
+
+    # Rate limiting functions
+    async def increment_rate_limit(self, user_id: str, action_type: str) -> Tuple[int, int]:
+        """
+        Increment rate limit counter and return current count and limit
+        action_type: 'request' or 'websocket'
+        """
+        key = f"rate:{user_id}:{action_type}:{date.today().isoformat()}"
+        
+        try:
+            # Get user's plan for limits
+            plan = await self.get_user_plan(user_id)
+            if not plan:
+                return 1, 0  # No plan, so count=1, limit=0 (always exceeded)
+                
+            # Get limit based on action type
+            limit = plan.requests_limit if action_type == 'request' else plan.websocket_limit
+            
+            # Increment with expiry
+            pipe = self.redis.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 86400)  # 24 hours TTL
+            results = await pipe.execute()
+            
+            count = results[0]
+            return count, limit
+        except Exception as e:
+            logger.error(f"Error tracking rate limit: {str(e)}")
+            return 1, 0  # Fail closed
+
+    async def record_metrics_snapshot(self, metrics_data: Dict[str, Any]):
+        """Record a snapshot of system metrics for monitoring"""
+        try:
+            await self.metrics.insert_one({
+                "timestamp": datetime.utcnow(),
+                **metrics_data
+            })
+            
+            # Clean up old metrics (keep only last 7 days)
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            await self.metrics.delete_many({"timestamp": {"$lt": cutoff}})
+            
+        except Exception as e:
+            logger.error(f"Error recording metrics: {str(e)}")
+
+    async def close(self):
+        """Close database connections"""
+        try:
+            self.mongo_client.close()
+            await self.redis.close()
+            logger.info("Database connections closed")
+        except Exception as e:
+            logger.error(f"Error closing database connections: {str(e)}")
+
+
+# docker compose
+version: '3.8'
+
+services:
+  nodom-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "8080:8080"
+    environment:
+      - API_PORT=3000
+      - MITM_PORT=8080
+      - MONGO_URI=mongodb://mongodb:27017/nodom_db
+      - REDIS_URI=redis://redis:6380/0  # Updated Redis port
+      - MAX_CONTEXTS=10
+      - CONTEXT_TTL=300
+      - CACHE_SIZE=1000
+      - CACHE_TTL=600
+      - MAX_WORKERS=20
+      - REQUEST_TIMEOUT=30
+      - WS_IDLE_TIMEOUT=600
+      - HEALTH_CHECK_INTERVAL=60
+      - AUTO_SCALE=true
+      - DEBUG=true
+      - KUBERNETES_ENABLED=false
+      - METRICS_ENABLED=true
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - mongodb
+      - redis
+    restart: unless-stopped
+
+  subscription-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.subscription
+    ports:
+      - "3001:3001"
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/nodom_db
+      - REDIS_URI=redis://redis:6380/0  # Updated Redis port
+      - STRIPE_API_KEY=${STRIPE_API_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    restart: unless-stopped
+
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6380:6379"  # Changed host port to 6380, container still uses 6379
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  mongodb-data:
+  redis-data:
+
+# Dockerfile:
+FROM python:3.10-slim
+
+# Install system dependencies with specific font packages available in Debian
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    ca-certificates \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-noto-core \
+    fonts-noto-mono \
+    fonts-freefont-ttf \
+    fonts-unifont \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libwayland-client0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    xdg-utils \
+    libu2f-udev \
+    libvulkan1 \
+    libpci3 \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install mitmproxy
+RUN pip install --no-cache-dir mitmproxy==9.0.1
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright and browsers
+RUN pip install playwright==1.35.0
+RUN playwright install chromium
+
+# Copy application code
+COPY . .
+
+# Create directories for logs and data
+RUN mkdir -p /app/logs /app/data
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Expose ports
+EXPOSE 3000 8080
+
+# Health check disabled for debugging
+# HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+#  CMD curl -f http://localhost:3000/status || exit 1
+
+# Run the application with debug output to stderr
+CMD python -u api_server.py
+
+# dockerfile.subscription:
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.subscription.txt .
+RUN pip install --no-cache-dir -r requirements.subscription.txt
+
+COPY models.py .
+COPY subscription_service.py .
+
+EXPOSE 3001
+
+CMD ["uvicorn", "subscription_service:app", "--host", "0.0.0.0", "--port", "3001"]
+
+# models.py
+from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import Dict, List, Optional, Any
+import uuid
+
+class Plan(BaseModel):
+    id: str
+    name: str
+    description: str
+    price: float
+    requests_limit: int
+    websocket_limit: int
+    concurrent_connections: int
+    max_request_size: int
+    max_response_size: int
+    max_duration: int  # in seconds
+    custom_headers_allowed: bool
+    proxy_regions: List[str]
+    features: List[str]
+    
+    @classmethod
+    def free_plan(cls):
+        return cls(
+            id="free",
+            name="Free",
+            description="Free tier with limited usage",
+            price=0.0,
+            requests_limit=100,  # daily limit
+            websocket_limit=5,   # daily limit
+            concurrent_connections=1,
+            max_request_size=1 * 1024 * 1024,  # 1 MB
+            max_response_size=5 * 1024 * 1024,  # 5 MB
+            max_duration=60,  # 60 seconds
+            custom_headers_allowed=False,
+            proxy_regions=["us-east"],
+            features=["basic_request_proxy"]
+        )
+        
+    @classmethod
+    def basic_plan(cls):
+        return cls(
+            id="basic",
+            name="Basic",
+            description="Basic tier for small projects",
+            price=9.0,
+            requests_limit=10000,  # daily limit
+            websocket_limit=500,   # daily limit
+            concurrent_connections=5,
+            max_request_size=5 * 1024 * 1024,  # 5 MB
+            max_response_size=20 * 1024 * 1024,  # 20 MB
+            max_duration=300,  # 5 minutes
+            custom_headers_allowed=True,
+            proxy_regions=["us-east", "us-west"],
+            features=["request_proxy", "websocket_proxy", "custom_headers"]
+        )
+        
+    @classmethod
+    def pro_plan(cls):
+        return cls(
+            id="pro",
+            name="Professional",
+            description="Professional tier for business use",
+            price=49.0,
+            requests_limit=100000,  # daily limit
+            websocket_limit=5000,   # daily limit
+            concurrent_connections=20,
+            max_request_size=20 * 1024 * 1024,  # 20 MB
+            max_response_size=100 * 1024 * 1024,  # 100 MB
+            max_duration=1800,  # 30 minutes
+            custom_headers_allowed=True,
+            proxy_regions=["us-east", "us-west", "eu-central", "ap-southeast"],
+            features=["request_proxy", "websocket_proxy", "custom_headers", "persistent_profiles", "priority_support"]
+        )
+        
+    @classmethod
+    def enterprise_plan(cls):
+        return cls(
+            id="enterprise",
+            name="Enterprise",
+            description="Enterprise tier for high volume",
+            price=199.0,
+            requests_limit=1000000,  # daily limit
+            websocket_limit=50000,   # daily limit
+            concurrent_connections=100,
+            max_request_size=100 * 1024 * 1024,  # 100 MB
+            max_response_size=500 * 1024 * 1024,  # 500 MB
+            max_duration=3600,  # 60 minutes
+            custom_headers_allowed=True,
+            proxy_regions=["us-east", "us-west", "eu-central", "eu-west", "ap-northeast", "ap-southeast", "sa-east"],
+            features=["request_proxy", "websocket_proxy", "custom_headers", "persistent_profiles", "priority_support", "dedicated_resources", "custom_integrations"]
+        )
+    
+    @classmethod
+    def all_plans(cls):
+        return [
+            cls.free_plan(),
+            cls.basic_plan(),
+            cls.pro_plan(),
+            cls.enterprise_plan(),
+        ]
+
+class User(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    username: str
+    email: str
+    password_hash: str
+    api_key: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    plan_id: str = "free"
+    is_active: bool = True
+    usage: Dict[str, Any] = {}
+    
+    class Config:
+        arbitrary_types_allowed = True
+
+class Usage(BaseModel):
+    user_id: str
+    date: str  # ISO format YYYY-MM-DD
+    requests_count: int = 0
+    websocket_connections: int = 0
+    data_transferred: int = 0  # in bytes
+    request_duration: float = 0.0  # in seconds
+    errors: int = 0
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
+
+class MetricsSnapshot(BaseModel):
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    total_requests: int
+    active_websockets: int
+    memory_usage: float  # MB
+    cpu_usage: float  # percentage
+    error_rate: float  # percentage
+    active_users: int
+
+# rate_limiter.py
+import logging
+import time
+from typing import Callable, Dict, Tuple
+import asyncio
+from aiohttp import web
+
+from db_service import DatabaseService
+
+logger = logging.getLogger('rate_limiter')
+
+class RateLimiter:
+    def __init__(self, db_service: DatabaseService):
+        self.db_service = db_service
+        
+    @web.middleware
+    async def rate_limit_middleware(self, request, handler):
+        # Skip rate limiting for non-API endpoints
+        if request.path in ['/login', '/register', '/health', '/metrics', '/plans'] or request.path.startswith('/static/'):
+            return await handler(request)
+            
+        # Skip if user not authenticated
+        if 'user' not in request or 'user_id' not in request:
+            return await handler(request)
+            
+        user_id = request['user_id']
+        is_websocket = request.path == '/ws'
+        action_type = 'websocket' if is_websocket else 'request'
+        
+        # Check rate limits
+        count, limit = await self.db_service.increment_rate_limit(user_id, action_type)
+        
+        # Add rate limit headers to response
+        response = await handler(request)
+        
+        if not isinstance(response, web.StreamResponse):
+            return response
+            
+        response.headers['X-RateLimit-Limit'] = str(limit)
+        response.headers['X-RateLimit-Remaining'] = str(max(0, limit - count))
+        response.headers['X-RateLimit-Reset'] = str(int(time.time() + 86400))  # Reset in 24 hours
+        
+        # If limits exceeded, return 429 Too Many Requests
+        if limit > 0 and count > limit:
+            return web.json_response({
+                "error": "Rate limit exceeded",
+                "message": f"You have exceeded your {action_type} rate limit. Please upgrade your plan or try again tomorrow."
+            }, status=429, headers={
+                'X-RateLimit-Limit': str(limit),
+                'X-RateLimit-Remaining': '0',
+                'X-RateLimit-Reset': str(int(time.time() + 86400)),
+                'Retry-After': '86400'  # Try again tomorrow
+            })
+            
+        return response
+
+Subscription requirements
+fastapi==0.95.2
+uvicorn==0.22.0
+pymongo==4.3.3
+motor==3.1.2
+pydantic==1.10.8
+python-jose==3.3.0
+stripe==7.0.0
+
+requirements
+aiohttp==3.8.4
+aiojobs==1.1.0
+asyncio==3.4.3
+cachetools==5.3.0
+mitmproxy==9.0.1
+playwright==1.35.0
+playwright-stealth==1.0.5
+psutil==5.9.5
+redis==4.5.5
+websockets==11.0.3
+pymongo==4.3.3  # Updated to match motor's requirements
+motor==3.1.2    # Updated
+pydantic==1.10.8
+python-jose==3.3.0
+passlib==1.7.4
+bcrypt==4.0.1
+fastapi==0.95.2
+uvicorn==0.22.0
+kubernetes==26.1.0
+prometheus-client==0.17.0
+typing-extensions==4.5.0
+
+
+# subscription_service.py
+import os
+import logging
+import asyncio
+import json
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
+
+import motor.motor_asyncio
+from fastapi import FastAPI, HTTPException, Depends, status, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+import stripe
+from jose import JWTError, jwt
+import uvicorn
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("subscription-service")
+
+# Initialize FastAPI app
+app = FastAPI(title="NoDOM Subscription API", version="1.0.0")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update with your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load configuration
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev_jwt_secret_not_for_production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_MINUTES = 60 * 24  # 24 hours
+
+# Initialize Stripe
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
+else:
+    logger.warning("STRIPE_API_KEY not set. Stripe functionality will be limited.")
+
+# Initialize MongoDB
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client.nodom_db
+
+# Stripe plan IDs mapping
+PLAN_STRIPE_IDS = {
+    "basic": os.environ.get("STRIPE_BASIC_PRICE_ID", "price_basic"),
+    "pro": os.environ.get("STRIPE_PRO_PRICE_ID", "price_pro"),
+    "enterprise": os.environ.get("STRIPE_ENTERPRISE_PRICE_ID", "price_enterprise")
+}
+
+# Models
+class TokenData(BaseModel):
+    user_id: str
+
+class SubscriptionRequest(BaseModel):
+    plan_id: str
+    user_id: str
+
+class SubscriptionResponse(BaseModel):
+    subscription_id: str
+    checkout_url: str
+
+class WebhookEvent(BaseModel):
+    type: str
+    data: Dict[str, Any]
+
+# Authentication functions
+async def get_current_user(request: Request) -> Dict[str, Any]:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    # Get token from header
+    authorization = request.headers.get("Authorization")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise credentials_exception
+    
+    token = authorization.replace("Bearer ", "")
+    
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+        
+        # Verify user exists
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise credentials_exception
+        
+        # Convert MongoDB _id to string
+        if "_id" in user:
+            user["_id"] = str(user["_id"])
+            
+        return user
+    except JWTError:
+        raise credentials_exception
+
+# Routes
+@app.get("/")
+async def root():
+    return {"message": "NoDOM Subscription API", "version": "1.0.0"}
+
+@app.get("/plans")
+async def get_plans():
+    """Get all available subscription plans"""
+    plans = await db.plans.find().to_list(None)
+    
+    # Convert MongoDB _id to string
+    for plan in plans:
+        plan["_id"] = str(plan["_id"])
+    
+    return JSONResponse(content={"plans": plans})
+
+@app.post("/subscriptions", response_model=SubscriptionResponse)
+async def create_subscription(
+    request: SubscriptionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Create a new subscription for a user"""
+    # Check if plan exists
+    plan = await db.plans.find_one({"id": request.plan_id})
+    if not plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plan {request.plan_id} not found"
+        )
+    
+    # Check if user exists
+    user = await db.users.find_one({"id": request.user_id})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {request.user_id} not found"
+        )
+    
+    # Check if user is the authenticated user
+    if current_user["id"] != request.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only create subscriptions for yourself"
+        )
+    
+    # Check if there's an existing stripe customer
+    stripe_customer_id = user.get("stripe_customer_id")
+    
+    if not stripe_customer_id:
+        # Create a new Stripe customer
+        customer = stripe.Customer.create(
+            email=user["email"],
+            name=user["username"],
+            metadata={"user_id": user["id"]}
+        )
+        stripe_customer_id = customer["id"]
+        
+        # Update user with stripe customer ID
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"stripe_customer_id": stripe_customer_id}}
+        )
+    
+    # Get Stripe price ID for the plan
+    price_id = PLAN_STRIPE_IDS.get(request.plan_id)
+    if not price_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No Stripe price ID found for plan {request.plan_id}"
+        )
+    
+    # Create a checkout session
+    checkout_session = stripe.checkout.Session.create(
+        customer=stripe_customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        mode="subscription",
+        success_url=f"https://nodom.io/subscription/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"https://nodom.io/subscription/cancel",
+        metadata={
+            "user_id": user["id"],
+            "plan_id": request.plan_id
+        }
+    )
+    
+    # Store checkout session in the database
+    await db.checkout_sessions.insert_one({
+        "session_id": checkout_session["id"],
+        "user_id": user["id"],
+        "plan_id": request.plan_id,
+        "created_at": datetime.utcnow(),
+        "status": "pending"
+    })
+    
+    return {
+        "subscription_id": checkout_session["id"],
+        "checkout_url": checkout_session["url"]
+    }
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handle Stripe webhook events"""
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.warning("STRIPE_WEBHOOK_SECRET not set. Webhook verification skipped.")
+        payload = await request.json()
+        event = {"type": payload.get("type"), "data": {"object": payload.get("data", {}).get("object", {})}}
+    else:
+        payload = await request.body()
+        sig_header = request.headers.get("Stripe-Signature")
+        
+        # Verify webhook signature
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid payload")
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    event_data = event["data"]["object"]
+    
+    # Handle checkout.session.completed event
+    if event["type"] == "checkout.session.completed":
+        session = event_data
+        user_id = session["metadata"]["user_id"]
+        plan_id = session["metadata"]["plan_id"]
+        
+        # Update user's subscription in the database
+        background_tasks.add_task(update_user_subscription, user_id, plan_id, session["subscription"])
+    
+    # Handle invoice.payment_succeeded event
+    elif event["type"] == "invoice.payment_succeeded":
+        invoice = event_data
+        subscription_id = invoice.get("subscription")
+        if subscription_id:
+            # Update subscription status
+            background_tasks.add_task(handle_invoice_paid, invoice)
+    
+    # Handle subscription events
+    elif event["type"] in ["customer.subscription.updated", "customer.subscription.deleted"]:
+        subscription = event_data
+        background_tasks.add_task(handle_subscription_update, subscription)
+    
+    return {"status": "success"}
+
+async def update_user_subscription(user_id: str, plan_id: str, subscription_id: str):
+    """Update a user's subscription after successful checkout"""
+    try:
+        # Get subscription details from Stripe
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        
+        # Update user in database
+        await db.users.update_one(
+            {"id": user_id},
+            {
+                "$set": {
+                    "plan_id": plan_id,
+                    "subscription_id": subscription_id,
+                    "subscription_status": subscription["status"],
+                    "subscription_current_period_end": datetime.fromtimestamp(subscription["current_period_end"]),
+                    "subscription_updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Update checkout session
+        await db.checkout_sessions.update_one(
+            {"session_id": subscription["metadata"].get("checkout_session_id")},
+            {"$set": {"status": "completed"}}
+        )
+        
+        logger.info(f"Updated subscription for user {user_id} to plan {plan_id}")
+    except Exception as e:
+        logger.error(f"Error updating subscription: {str(e)}")
+
+async def handle_invoice_paid(invoice):
+    """Handle a successful invoice payment"""
+    subscription_id = invoice.get("subscription")
+    if not subscription_id:
+        return
+    
+    try:
+        # Get subscription from Stripe
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        
+        # Get user ID from subscription metadata
+        stripe_customer_id = subscription["customer"]
+        
+        # Find user with this customer ID
+        user = await db.users.find_one({"stripe_customer_id": stripe_customer_id})
+        if not user:
+            logger.error(f"No user found with stripe customer ID {stripe_customer_id}")
+            return
+            
+        # Update subscription information
+        await db.users.update_one(
+            {"id": user["id"]},
+            {
+                "$set": {
+                    "subscription_status": subscription["status"],
+                    "subscription_current_period_end": datetime.fromtimestamp(subscription["current_period_end"]),
+                    "subscription_updated_at": datetime.utcnow(),
+                    "last_payment_date": datetime.utcnow(),
+                    "last_invoice_id": invoice["id"]
+                }
+            }
+        )
+        
+        logger.info(f"Updated payment info for user {user['id']}")
+    except Exception as e:
+        logger.error(f"Error handling invoice payment: {str(e)}")
+
+async def handle_subscription_update(subscription):
+    """Handle subscription update or cancellation"""
+    try:
+        stripe_customer_id = subscription["customer"]
+        status = subscription["status"]
+        
+        # Find user with this customer ID
+        user = await db.users.find_one({"stripe_customer_id": stripe_customer_id})
+        if not user:
+            logger.error(f"No user found with stripe customer ID {stripe_customer_id}")
+            return
+        
+        # Update subscription status
+        update_data = {
+            "subscription_status": status,
+            "subscription_updated_at": datetime.utcnow()
+        }
+        
+        # If subscription is canceled or expired, revert to free plan
+        if status in ["canceled", "unpaid", "incomplete_expired"]:
+            update_data["plan_id"] = "free"
+        
+        # Update current period end if available
+        if "current_period_end" in subscription:
+            update_data["subscription_current_period_end"] = datetime.fromtimestamp(subscription["current_period_end"])
+        
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": update_data}
+        )
+        
+        logger.info(f"Updated subscription status to {status} for user {user['id']}")
+    except Exception as e:
+        logger.error(f"Error handling subscription update: {str(e)}")
+
+if __name__ == "__main__":
+    uvicorn.run("subscription_service:app", host="0.0.0.0", port=3001, reload=True)
